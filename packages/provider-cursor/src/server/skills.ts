@@ -4,6 +4,7 @@ import type { ServerProviderSkill } from "@t3tools/contracts";
 import * as ByteSize from "effect/ByteSize";
 import * as Effect from "effect/Effect";
 import * as FileSystem from "effect/FileSystem";
+import * as Option from "effect/Option";
 import * as Path from "effect/Path";
 import * as PlatformError from "effect/PlatformError";
 import * as Schema from "effect/Schema";
@@ -122,7 +123,7 @@ function parseSkillFrontmatter(contents: string): CursorSkillFrontmatter | undef
 
 const discoverSkillsInRoot = Effect.fn("discoverCursorSkillsInRoot")(function* (input: {
   readonly directory: string;
-  readonly scope: "user" | "project" | "system";
+  readonly scope: "user" | "project" | "plugin" | "system";
   readonly budget: CursorSkillScanBudget;
   readonly scannedRoots: Set<string>;
 }): Effect.fn.Return<ReadonlyArray<ServerProviderSkill>, never, FileSystem.FileSystem | Path.Path> {
@@ -223,6 +224,77 @@ const discoverSkillsInRoot = Effect.fn("discoverCursorSkillsInRoot")(function* (
   return skills;
 });
 
+const CURSOR_PLUGIN_MANIFESTS = [
+  [".cursor-plugin", "plugin.json"],
+  [".claude-plugin", "plugin.json"],
+  ["plugin.json"],
+] as const;
+const decodeCursorPluginManifest = Schema.decodeUnknownOption(
+  Schema.fromJsonString(Schema.Struct({ skills: Schema.optional(Schema.Unknown) })),
+);
+
+// Cursor's servers own the enabled-plugin list; its SDK caches each enabled plugin at
+// `cache/<marketplace>/<plugin>/<version>` and marks complete copies with `.cache-complete`.
+const listCursorPluginDirectories = Effect.fn("listCursorPluginDirectories")(function* (
+  pluginsRoot: string,
+) {
+  const fileSystem = yield* FileSystem.FileSystem;
+  const path = yield* Path.Path;
+  const children = (directory: string) =>
+    orUndefined(fileSystem.readDirectory(directory)).pipe(
+      Effect.map((entries) =>
+        (entries ?? [])
+          .filter((entry) => !entry.startsWith("."))
+          .sort()
+          .map((entry) => path.join(directory, entry)),
+      ),
+    );
+
+  const directories = [...(yield* children(path.join(pluginsRoot, "local")))];
+  for (const marketplace of yield* children(path.join(pluginsRoot, "cache"))) {
+    for (const plugin of yield* children(marketplace)) {
+      let newest: { readonly directory: string; readonly completedAt: number } | undefined;
+      for (const version of yield* children(plugin)) {
+        const marker = yield* orUndefined(fileSystem.stat(path.join(version, ".cache-complete")));
+        if (marker?.type !== "File") continue;
+        const completedAt = Option.getOrUndefined(marker.mtime)?.getTime() ?? 0;
+        if (!newest || completedAt > newest.completedAt)
+          newest = { directory: version, completedAt };
+      }
+      if (newest) directories.push(newest.directory);
+    }
+  }
+  return directories;
+});
+
+const resolveCursorPluginSkillRoots = Effect.fn("resolveCursorPluginSkillRoots")(function* (
+  pluginDirectory: string,
+) {
+  const fileSystem = yield* FileSystem.FileSystem;
+  const path = yield* Path.Path;
+  let declared: unknown;
+  for (const segments of CURSOR_PLUGIN_MANIFESTS) {
+    const contents = yield* orUndefined(
+      fileSystem.readFileString(path.join(pluginDirectory, ...segments)),
+    );
+    const manifest = contents === undefined ? Option.none() : decodeCursorPluginManifest(contents);
+    if (Option.isNone(manifest)) continue;
+    declared = manifest.value.skills;
+    break;
+  }
+  const entries =
+    typeof declared === "string"
+      ? [declared]
+      : Array.isArray(declared)
+        ? declared.filter((entry): entry is string => typeof entry === "string")
+        : ["skills"];
+  return entries.flatMap((entry) => {
+    const directory = path.resolve(pluginDirectory, entry.replace(/[\\/]SKILL\.md$/u, ""));
+    const relative = path.relative(pluginDirectory, directory);
+    return relative.startsWith("..") || path.isAbsolute(relative) ? [] : [directory];
+  });
+});
+
 const inspectCursorSkills = Effect.fn("inspectCursorSkills")(function* (
   cwd?: string,
   environment: NodeJS.ProcessEnv = process.env,
@@ -238,9 +310,14 @@ const inspectCursorSkills = Effect.fn("inspectCursorSkills")(function* (
     { directory: path.join(base, ".codex", "skills"), scope },
     { directory: path.join(base, ".claude", "skills"), scope },
   ];
+  const pluginDirectories = yield* listCursorPluginDirectories(
+    path.join(userHome, ".cursor", "plugins"),
+  );
+  const pluginSkillRoots = yield* Effect.forEach(pluginDirectories, resolveCursorPluginSkillRoots);
   const roots = [
     ...(cwd ? rootsBelow(cwd, "project") : []),
     ...rootsBelow(userHome, "user"),
+    ...pluginSkillRoots.flat().map((directory) => ({ directory, scope: "plugin" as const })),
     // Cursor syncs its built-in skills here; same-named user and project skills win.
     { directory: path.join(userHome, ".cursor", "skills-cursor"), scope: "system" as const },
   ];

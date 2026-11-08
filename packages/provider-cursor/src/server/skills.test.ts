@@ -21,7 +21,7 @@ const runNode = <A, E>(
 ) => effect.pipe(Effect.scoped, Effect.provide(NodeServices.layer), Effect.runPromise);
 
 describe("Cursor skills", () => {
-  it("discovers project, user, then built-in skills by precedence", async () =>
+  it("discovers project, user, plugin, then built-in skills by precedence", async () =>
     await runNode(
       Effect.gen(function* () {
         const fileSystem = yield* FileSystem.FileSystem;
@@ -71,6 +71,40 @@ describe("Cursor skills", () => {
         const builtinRoot = path.join(userHome, ".cursor", "skills-cursor");
         yield* writeSkill(builtinRoot, "loop", "---\ndescription: builtin loop\n---\n");
         yield* writeSkill(builtinRoot, "review", "---\ndescription: builtin review\n---\n");
+        const pluginsRoot = path.join(userHome, ".cursor", "plugins");
+        const localPlugin = path.join(pluginsRoot, "local", "team-kit");
+        yield* writeSkill(
+          path.join(localPlugin, "skills"),
+          "ship",
+          "---\ndescription: ship\n---\n",
+        );
+        yield* writeSkill(path.join(localPlugin, "skills"), "review", "---\n---\n");
+        const cachedPlugin = path.join(pluginsRoot, "cache", "cursor-public", "figma");
+        const writeCachedVersion = Effect.fn("writeCachedCursorPlugin")(function* (
+          version: string,
+          complete: boolean,
+          completedAt: number,
+        ) {
+          const directory = path.join(cachedPlugin, version);
+          yield* fileSystem.makeDirectory(path.join(directory, ".cursor-plugin"), {
+            recursive: true,
+          });
+          yield* fileSystem.writeFileString(
+            path.join(directory, ".cursor-plugin", "plugin.json"),
+            JSON.stringify({ name: "figma", skills: ["./skills-figquery/", "../escape"] }),
+          );
+          yield* writeSkill(path.join(directory, "skills-figquery"), `figma-${version}`, "");
+          yield* writeSkill(path.join(directory, "skills"), `unlisted-${version}`, "");
+          if (!complete) return;
+          const marker = path.join(directory, ".cache-complete");
+          yield* fileSystem.writeFileString(marker, "");
+          yield* fileSystem.utimes(marker, completedAt, completedAt);
+        });
+        yield* writeCachedVersion("old", true, 1_000_000);
+        yield* writeCachedVersion("new", true, 2_000_000);
+        yield* writeCachedVersion("partial", false, 3_000_000);
+        yield* writeSkill(cachedPlugin, "escape", "");
+        yield* fileSystem.writeFileString(path.join(cachedPlugin, "new.installed"), "");
         yield* writeSkill(builtinRoot, "ide-only", "---\nmetadata:\n  surfaces:\n    - ide\n---\n");
         yield* fileSystem.makeDirectory(path.join(userHome, ".codex"), { recursive: true });
         yield* fileSystem.writeFileString(
@@ -80,6 +114,12 @@ describe("Cursor skills", () => {
 
         const skills = yield* discoverCursorSkills(workspace, { HOME: userHome });
         expect(skills).toEqual([
+          {
+            name: "figma-new",
+            path: path.join(cachedPlugin, "new", "skills-figquery", "figma-new", "SKILL.md"),
+            scope: "plugin",
+            enabled: true,
+          },
           {
             name: "internal",
             path: path.join(workspace, ".cursor", "skills", "internal", "SKILL.md"),
@@ -106,6 +146,13 @@ describe("Cursor skills", () => {
             description: "project review",
             path: path.join(workspace, ".agents", "skills", "nested", "review", "SKILL.md"),
             scope: "project",
+            enabled: true,
+          },
+          {
+            name: "ship",
+            description: "ship",
+            path: path.join(localPlugin, "skills", "ship", "SKILL.md"),
+            scope: "plugin",
             enabled: true,
           },
         ]);
